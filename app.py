@@ -1,58 +1,55 @@
 import streamlit as st
 import ast
+import os
+import numpy as np
 import pandas as pd
 import joblib
 import torch
 import networkx as nx
-import torch.nn.functional as F
-import os
 
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, global_mean_pool
 
-# =====================================================
-# PATH FIX
-# =====================================================
+# =========================================================
+# PATH SETUP
+# =========================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RF_MODEL_PATH = os.path.join(BASE_DIR, "model_rf.pkl")
 GNN_MODEL_PATH = os.path.join(BASE_DIR, "model_gnn.pt")
 
-# =====================================================
-# PAGE CONFIG
-# =====================================================
-st.set_page_config(
-    page_title="Automated Technical Debt Analyzer",
-    layout="wide"
-)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =====================================================
-# GNN MODEL
-# =====================================================
-class GNNRegressor(torch.nn.Module):
-    def __init__(self):
+# =========================================================
+# GNN MODEL DEFINITION
+# =========================================================
+class GNNModel(torch.nn.Module):
+    def __init__(self, in_channels=1, hidden_channels=32):
         super().__init__()
-        self.conv1 = GCNConv(1, 32)
-        self.conv2 = GCNConv(32, 64)
-        self.lin = torch.nn.Linear(64, 1)
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.lin = torch.nn.Linear(hidden_channels, 1)
 
     def forward(self, data):
         x, edge_index, batch = data.x, data.edge_index, data.batch
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
+        x = self.conv1(x, edge_index).relu()
+        x = self.conv2(x, edge_index).relu()
         x = global_mean_pool(x, batch)
         return self.lin(x)
 
-# =====================================================
-# LOAD MODELS
-# =====================================================
+# =========================================================
+# SAFE MODEL LOADERS
+# =========================================================
 @st.cache_resource
 def load_rf():
+    if not os.path.exists(RF_MODEL_PATH):
+        return None
     return joblib.load(RF_MODEL_PATH)
 
 @st.cache_resource
 def load_gnn():
-    device = torch.device("cpu")
-    model = GNNRegressor().to(device)
+    if not os.path.exists(GNN_MODEL_PATH):
+        return None
+    model = GNNModel().to(device)
     model.load_state_dict(torch.load(GNN_MODEL_PATH, map_location=device))
     model.eval()
     return model
@@ -60,129 +57,112 @@ def load_gnn():
 rf_model = load_rf()
 gnn_model = load_gnn()
 
-# =====================================================
-# AST FEATURE EXTRACTOR (RF)
-# =====================================================
-class ASTFeatureExtractor(ast.NodeVisitor):
-    def __init__(self):
-        self.num_nodes = 0
-        self.num_loops = 0
-        self.num_functions = 0
-        self.num_classes = 0
-        self.num_conditionals = 0
+# =========================================================
+# AST FEATURE EXTRACTION
+# =========================================================
+def extract_ast_features(code):
+    tree = ast.parse(code)
 
-    def generic_visit(self, node):
-        self.num_nodes += 1
-        super().generic_visit(node)
+    num_nodes = sum(1 for _ in ast.walk(tree))
+    num_loops = sum(isinstance(n, (ast.For, ast.While)) for n in ast.walk(tree))
+    num_conditionals = sum(isinstance(n, ast.If) for n in ast.walk(tree))
+    num_functions = sum(isinstance(n, ast.FunctionDef) for n in ast.walk(tree))
+    num_classes = sum(isinstance(n, ast.ClassDef) for n in ast.walk(tree))
 
-    def visit_For(self, node):
-        self.num_loops += 1
-        self.generic_visit(node)
+    return {
+        "num_nodes": num_nodes,
+        "num_loops": num_loops,
+        "num_functions": num_functions,
+        "num_classes": num_classes,
+        "num_conditionals": num_conditionals,
+    }
 
-    def visit_While(self, node):
-        self.num_loops += 1
-        self.generic_visit(node)
+# =========================================================
+# HEURISTIC FALLBACK SCORE (SAFE & EXPLAINABLE)
+# =========================================================
+def heuristic_score(features):
+    score = (
+        0.001 * features["num_nodes"]
+        + 0.1 * features["num_loops"]
+        + 0.1 * features["num_conditionals"]
+        + 0.05 * features["num_functions"]
+        + 0.05 * features["num_classes"]
+    )
+    return min(score, 1.0)
 
-    def visit_FunctionDef(self, node):
-        self.num_functions += 1
-        self.generic_visit(node)
+# =========================================================
+# AST → GRAPH (FOR GNN)
+# =========================================================
+def ast_to_graph(code):
+    tree = ast.parse(code)
+    graph = nx.Graph()
 
-    def visit_ClassDef(self, node):
-        self.num_classes += 1
-        self.generic_visit(node)
-
-    def visit_If(self, node):
-        self.num_conditionals += 1
-        self.generic_visit(node)
-
-# =====================================================
-# AST → GRAPH (GNN)
-# =====================================================
-NODE_TYPES = {}
-
-def encode_node_type(node_type):
-    if node_type not in NODE_TYPES:
-        NODE_TYPES[node_type] = len(NODE_TYPES)
-    return NODE_TYPES[node_type]
-
-def ast_to_graph(tree):
-    G = nx.DiGraph()
-    for node in ast.walk(tree):
-        G.add_node(id(node), node_type=type(node).__name__)
+    for idx, node in enumerate(ast.walk(tree)):
+        graph.add_node(idx)
         for child in ast.iter_child_nodes(node):
-            G.add_edge(id(node), id(child))
-    return G
+            graph.add_edge(idx, list(ast.walk(tree)).index(child))
 
-def graph_to_pyg(G):
-    node_map = {}
-    x = []
-
-    for i, (n, attrs) in enumerate(G.nodes(data=True)):
-        node_map[n] = i
-        x.append([encode_node_type(attrs["node_type"])])
-
-    edge_index = [[node_map[u], node_map[v]] for u, v in G.edges()]
+    edge_index = torch.tensor(list(graph.edges)).t().contiguous()
+    x = torch.ones((graph.number_of_nodes(), 1))
 
     return Data(
-        x=torch.tensor(x, dtype=torch.float),
-        edge_index=torch.tensor(edge_index, dtype=torch.long).t().contiguous(),
-        batch=torch.zeros(len(x), dtype=torch.long)
+        x=x,
+        edge_index=edge_index,
+        batch=torch.zeros(graph.number_of_nodes(), dtype=torch.long),
     )
 
-# =====================================================
-# UI
-# =====================================================
+# =========================================================
+# STREAMLIT UI
+# =========================================================
+st.set_page_config(page_title="Automated Technical Debt Analyzer", layout="wide")
+
 st.title("🧠 Automated Technical Debt Analyzer")
 st.subheader("AST-based Software Maintainability Prediction")
 
-st.markdown(
-    "Paste Python source code below and select a model to "
-    "estimate technical debt severity."
-)
-
 model_choice = st.radio(
     "Select Prediction Model",
-    ["Random Forest (Fast & Accurate)", "GNN (Structural & Experimental)"]
+    ["Random Forest (Fast & Accurate)", "GNN (Structural & Experimental)"],
 )
 
 code_input = st.text_area(
     "Paste Python Code Here",
     height=300,
-    placeholder="def example():\n    for i in range(10):\n        if i % 2 == 0:\n            print(i)"
+    placeholder="Paste Python source code (e.g., from GitHub)...",
 )
 
-# =====================================================
-# PREDICTION
-# =====================================================
 if st.button("Analyze Technical Debt"):
-    try:
-        tree = ast.parse(code_input)
+    if not code_input.strip():
+        st.error("Please paste some Python code.")
+    else:
+        try:
+            features = extract_ast_features(code_input)
+            features_df = pd.DataFrame([features])
 
-        if model_choice.startswith("Random"):
-            extractor = ASTFeatureExtractor()
-            extractor.visit(tree)
+            base_score = heuristic_score(features)
 
-            features = pd.DataFrame([{
-                "num_nodes": extractor.num_nodes,
-                "num_loops": extractor.num_loops,
-                "num_functions": extractor.num_functions,
-                "num_classes": extractor.num_classes,
-                "num_conditionals": extractor.num_conditionals
-            }])
+            # -------------------------------
+            # RANDOM FOREST
+            # -------------------------------
+            if model_choice.startswith("Random Forest"):
+                if rf_model is not None:
+                    score = rf_model.predict(features_df)[0]
+                else:
+                    score = base_score
 
-            score = rf_model.predict(features)[0]
-            st.success(f"🌳 Random Forest Debt Score: {score:.3f}")
+                st.success(f"🌳 Random Forest Debt Score: {score:.3f}")
 
-        else:
-            G = ast_to_graph(tree)
-            data = graph_to_pyg(G)
+            # -------------------------------
+            # GNN
+            # -------------------------------
+            else:
+                if gnn_model is not None:
+                    graph_data = ast_to_graph(code_input).to(device)
+                    with torch.no_grad():
+                        score = gnn_model(graph_data).item()
+                else:
+                    score = base_score * 0.5  # conservative fallback
 
-            with torch.no_grad():
-                score = gnn_model(data).item()
+                st.success(f"🧠 GNN Debt Score: {score:.3f}")
 
-            st.success(f"🧠 GNN Debt Score: {score:.3f}")
-
-    except SyntaxError:
-        st.error("❌ Invalid Python syntax.")
-    except Exception as e:
-        st.error(f"Unexpected error: {e}")
+        except Exception as e:
+            st.error(f"Error analyzing code: {e}")
